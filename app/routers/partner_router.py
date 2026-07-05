@@ -1,9 +1,10 @@
 from decimal import Decimal
+from datetime import timedelta
 from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -17,6 +18,7 @@ from app.models import (
     Habit,
     SubGoal,
     Task,
+    Transaction,
     TransactionTypeEnum,
     User,
     Wallet,
@@ -35,7 +37,8 @@ from app.schemas import (
     UserPublicProfile,
     WalletResponse,
 )
-from app.utils.time import utc_now
+from app.utils.money import to_money
+from app.utils.time import local_date_for_user, local_day_bounds_utc, local_period_bounds_utc, utc_now
 
 router = APIRouter(prefix="/partner", tags=["Partner"])
 
@@ -93,6 +96,56 @@ def goal_to_dict(goal: Goal) -> dict:
         sg_data["tasks"] = [TaskResponse.model_validate(t).model_dump(mode="json") for t in sg.tasks if t.deleted_at is None and not t.is_private]
         data["sub_goals"].append(sg_data)
     return data
+
+
+def partner_goal_progress(goal: Goal) -> float:
+    if goal.is_completed:
+        return 100.0
+    if goal.progress_mode != "weighted_subgoals" and goal.target_value and goal.target_value > 0:
+        return round(min(100.0, max(0.0, ((goal.current_value or 0.0) / goal.target_value) * 100)), 2)
+
+    active_subgoals = [subgoal for subgoal in goal.sub_goals if subgoal.deleted_at is None]
+    if not active_subgoals:
+        return 0.0
+
+    progress_values = []
+    for subgoal in active_subgoals:
+        if subgoal.is_completed:
+            progress_values.append(100.0)
+            continue
+        visible_tasks = [task for task in subgoal.tasks if task.deleted_at is None and not task.is_private]
+        if visible_tasks:
+            completed_tasks = sum(1 for task in visible_tasks if task.is_completed)
+            progress_values.append((completed_tasks / len(visible_tasks)) * 100)
+        elif subgoal.target_value and subgoal.target_value > 0:
+            progress_values.append(min(100.0, max(0.0, ((subgoal.current_value or 0.0) / subgoal.target_value) * 100)))
+        else:
+            progress_values.append(0.0)
+
+    return round(sum(progress_values) / len(progress_values), 2)
+
+
+def visible_partner_transactions_query(db: Session, partner_id: UUID):
+    return db.query(Transaction).join(Wallet).filter(
+        Wallet.user_id == partner_id,
+        Wallet.deleted_at.is_(None),
+        Transaction.is_private.is_(False),
+        Transaction.deleted_at.is_(None),
+    )
+
+
+def partner_transaction_total(
+    db: Session,
+    partner_id: UUID,
+    transaction_type: TransactionTypeEnum,
+    start_date,
+    end_date,
+) -> float:
+    return float(to_money(visible_partner_transactions_query(db, partner_id).filter(
+        Transaction.type == transaction_type,
+        Transaction.transaction_date >= start_date,
+        Transaction.transaction_date < end_date,
+    ).with_entities(func.sum(Transaction.amount)).scalar()))
 
 
 @router.get("/sharing-scope", response_model=PartnerSharingScopeResponse)
@@ -228,6 +281,170 @@ def get_partner_productivity(partner_id: UUID, current_user: User = Depends(get_
 def get_partner_tasks(partner_id: UUID, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     accepted_connection_or_404(db, current_user.id, partner_id)
     return db.query(Task).filter(Task.user_id == partner_id, Task.is_private.is_(False), Task.deleted_at.is_(None)).order_by(Task.created_at.desc()).all()
+
+
+@router.get("/{partner_id}/analytics/dashboard")
+def get_partner_dashboard_analytics(partner_id: UUID, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    accepted_connection_or_404(db, current_user.id, partner_id)
+    partner = db.query(User).filter(User.id == partner_id, User.deleted_at.is_(None)).first()
+    if not partner:
+        raise HTTPException(status_code=404, detail="Partner not found")
+
+    now = utc_now()
+    local_today = local_date_for_user(current_user, now)
+    week_start, week_end = local_period_bounds_utc(current_user, "weekly", now)
+    month_start, month_end = local_period_bounds_utc(current_user, "monthly", now)
+    cashflow_start, _ = local_day_bounds_utc(current_user, local_today - timedelta(days=6))
+    _, cashflow_end = local_day_bounds_utc(current_user, local_today)
+
+    goals = db.query(Goal).options(joinedload(Goal.sub_goals).joinedload(SubGoal.tasks)).filter(
+        Goal.user_id == partner_id,
+        Goal.deleted_at.is_(None),
+    ).order_by(Goal.is_completed.asc(), Goal.target_date.asc().nullslast(), Goal.created_at.asc()).all()
+    visible_tasks_query = db.query(Task).filter(
+        Task.user_id == partner_id,
+        Task.is_private.is_(False),
+        Task.deleted_at.is_(None),
+    )
+    total_tasks = visible_tasks_query.count()
+    completed_tasks = visible_tasks_query.filter(Task.is_completed.is_(True)).count()
+    completed_this_week = visible_tasks_query.filter(
+        Task.is_completed.is_(True),
+        Task.completed_at.isnot(None),
+        Task.completed_at >= week_start,
+        Task.completed_at < min(now, week_end),
+    ).count()
+    created_this_week = visible_tasks_query.filter(
+        Task.created_at >= week_start,
+        Task.created_at < min(now, week_end),
+    ).count()
+
+    total_goals = len(goals)
+    completed_goals = sum(1 for goal in goals if goal.is_completed)
+    good_habits = db.query(Habit).filter(Habit.user_id == partner_id, Habit.habit_type == HabitTypeEnum.good, Habit.deleted_at.is_(None)).count()
+    bad_habits = db.query(Habit).filter(Habit.user_id == partner_id, Habit.habit_type == HabitTypeEnum.bad, Habit.deleted_at.is_(None)).count()
+    total_habit_completions = db.query(func.coalesce(func.sum(Habit.total_completions), 0)).filter(Habit.user_id == partner_id, Habit.deleted_at.is_(None)).scalar() or 0
+
+    total_wallets = db.query(Wallet).filter(Wallet.user_id == partner_id, Wallet.deleted_at.is_(None)).count()
+    total_balance = to_money(db.query(func.sum(Wallet.balance)).filter(Wallet.user_id == partner_id, Wallet.deleted_at.is_(None)).scalar())
+    total_income_month = partner_transaction_total(db, partner_id, TransactionTypeEnum.income, month_start, month_end)
+    total_expense_month = partner_transaction_total(db, partner_id, TransactionTypeEnum.expense, month_start, month_end)
+
+    cashflow_map = {
+        (local_today - timedelta(days=i)).isoformat(): {"income": 0.0, "expense": 0.0}
+        for i in range(6, -1, -1)
+    }
+    cashflow_rows = visible_partner_transactions_query(db, partner_id).filter(
+        Transaction.transaction_date >= cashflow_start,
+        Transaction.transaction_date < cashflow_end,
+    ).all()
+    for tx in cashflow_rows:
+        day = local_date_for_user(current_user, tx.transaction_date).isoformat()
+        if day not in cashflow_map:
+            continue
+        key = "income" if tx.type == TransactionTypeEnum.income else "expense"
+        cashflow_map[day][key] += float(tx.amount or 0.0)
+    weekly_cashflow = [{"date": day, **cashflow_map[day]} for day in sorted(cashflow_map.keys())]
+
+    daily_task_trend = []
+    local_week_start = local_today - timedelta(days=local_today.weekday())
+    for day_index in range(7):
+        local_day = local_week_start + timedelta(days=day_index)
+        day_start, day_end = local_day_bounds_utc(current_user, local_day)
+        total = visible_tasks_query.filter(
+            Task.due_date.isnot(None),
+            Task.due_date >= day_start,
+            Task.due_date < day_end,
+        ).count()
+        completed = visible_tasks_query.filter(
+            Task.is_completed.is_(True),
+            Task.due_date.isnot(None),
+            Task.due_date >= day_start,
+            Task.due_date < day_end,
+        ).count()
+        daily_task_trend.append({
+            "date": local_day.isoformat(),
+            "total": total,
+            "completed": completed,
+            "completion_rate": round((completed / total * 100) if total else 0.0, 2),
+        })
+
+    category_rows = visible_partner_transactions_query(db, partner_id).filter(
+        Transaction.transaction_date >= month_start,
+        Transaction.transaction_date < month_end,
+    ).with_entities(
+        Transaction.category,
+        Transaction.type,
+        func.coalesce(func.sum(Transaction.amount), 0.0).label("total"),
+    ).group_by(Transaction.category, Transaction.type).all()
+    financial_breakdown_map = {}
+    for row in category_rows:
+        category = row.category or "Lainnya"
+        financial_breakdown_map.setdefault(category, {"category": category, "income": 0.0, "expense": 0.0})
+        key = "income" if row.type == TransactionTypeEnum.income else "expense"
+        financial_breakdown_map[category][key] += float(row.total or 0.0)
+
+    numeric_goal_progress = [
+        {
+            "id": str(goal.id),
+            "title": goal.title,
+            "target_value": float(goal.target_value or 100.0),
+            "current_value": float(goal.current_value or 0.0),
+            "target_unit": goal.target_unit,
+            "progress_mode": goal.progress_mode or "manual",
+            "progress_rate": partner_goal_progress(goal),
+        }
+        for goal in goals[:6]
+    ]
+
+    completion_rate = round((completed_tasks / total_tasks * 100) if total_tasks else 0.0, 2)
+    productivity_score = min(100.0, max(0.0, completion_rate * 0.75 + min(25.0, total_habit_completions * 1.5)))
+    finance_score = 0.0
+    if total_income_month > 0:
+        finance_score = min(100.0, max(0.0, 50.0 + ((total_income_month - total_expense_month) / total_income_month * 100)))
+    elif total_expense_month > 0:
+        finance_score = 35.0
+    life_score = round((productivity_score + finance_score) / 2, 2)
+
+    return {
+        "level": partner.level or 1,
+        "xp_balance": partner.xp_balance or 0,
+        "total_xp_earned": partner.total_xp_earned or 0,
+        "coin_balance": partner.coin_balance or 0,
+        "xp_needed_for_next_level": 0,
+        "total_goals": total_goals,
+        "completed_goals": completed_goals,
+        "total_tasks": total_tasks,
+        "completed_tasks": completed_tasks,
+        "good_habits": good_habits,
+        "bad_habits": bad_habits,
+        "total_habit_completions": int(total_habit_completions),
+        "total_wallets": total_wallets,
+        "total_balance": float(total_balance),
+        "total_income_month": round(total_income_month, 2),
+        "total_expense_month": round(total_expense_month, 2),
+        "weekly_task_metrics": {
+            "total": total_tasks,
+            "completed": completed_tasks,
+            "completion_rate": completion_rate,
+            "completed_this_week": completed_this_week,
+            "created_this_week": created_this_week,
+            "overdue": visible_tasks_query.filter(Task.is_completed.is_(False), Task.due_date.isnot(None), Task.due_date < now).count(),
+            "due_today": 0,
+        },
+        "weekly_cashflow": weekly_cashflow,
+        "financial_breakdown": list(financial_breakdown_map.values()),
+        "weekly_comparison": [],
+        "task_completion_rates": [],
+        "daily_task_trend": daily_task_trend,
+        "upcoming_deadlines": [],
+        "recent_activities": [],
+        "numeric_goal_progress": numeric_goal_progress,
+        "time_allocation": [],
+        "productivity_score": round(productivity_score, 2),
+        "finance_score": round(finance_score, 2),
+        "life_score": life_score,
+    }
 
 
 @router.get("/{partner_id}/finance")
