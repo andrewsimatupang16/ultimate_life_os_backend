@@ -97,6 +97,7 @@ from app.models import (
     ConnectionStatusEnum,
     DifficultyEnum,
     HabitTypeEnum,
+    PriorityEnum,
     TransactionTypeEnum,
     WalletTypeEnum,
 )
@@ -338,6 +339,7 @@ class KeyResultHistoryResponse(BaseModel):
 class TaskCreate(DateTimeInputSchema):
     title: str
     difficulty: DifficultyEnum = DifficultyEnum.medium
+    priority: PriorityEnum = PriorityEnum.medium
     sub_goal_id: Optional[UUID] = None
     is_private: bool = False
     is_daily: bool = False
@@ -352,6 +354,7 @@ class TaskCreate(DateTimeInputSchema):
 class TaskUpdate(DateTimeInputSchema):
     title: Optional[str] = None
     difficulty: Optional[DifficultyEnum] = None
+    priority: Optional[PriorityEnum] = None
     is_completed: Optional[bool] = None
     is_private: Optional[bool] = None
     used_timer: Optional[bool] = None
@@ -370,6 +373,7 @@ class TaskResponse(BaseSchema):
     sub_goal_id: Optional[UUID] = None
     title: str
     difficulty: DifficultyEnum
+    priority: PriorityEnum
     is_completed: bool = False
     completed_at: Optional[datetime] = None
     is_private: bool = False

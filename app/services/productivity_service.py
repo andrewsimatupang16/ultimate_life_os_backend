@@ -11,6 +11,7 @@ class ProductivityService:
             user_id=user_id,
             title=data.title,
             difficulty=data.difficulty,
+            priority=data.priority,
             sub_goal_id=data.sub_goal_id,
             is_private=data.is_private,
             is_daily=data.is_daily,

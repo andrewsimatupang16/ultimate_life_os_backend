@@ -67,6 +67,12 @@ class DifficultyEnum(str, enum.Enum):
     hard = "hard"
 
 
+class PriorityEnum(str, enum.Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
 class HabitTypeEnum(str, enum.Enum):
     good = "good"
     bad = "bad"
@@ -245,6 +251,7 @@ class Task(Base):
     sub_goal_id = Column(GUID(), ForeignKey("sub_goals.id"), nullable=True)
     title = Column(String, nullable=False)
     difficulty = Column(Enum(DifficultyEnum, native_enum=False), nullable=False, default=DifficultyEnum.medium)
+    priority = Column(Enum(PriorityEnum, native_enum=False), nullable=False, default=PriorityEnum.medium)
     is_completed = Column(Boolean, default=False)
     completed_at = Column(DateTime, nullable=True)
     is_private = Column(Boolean, default=False)

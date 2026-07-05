@@ -465,6 +465,7 @@ def create_task(payload: TaskCreate, current_user: User = Depends(get_current_us
         user_id=current_user.id,
         title=payload.title,
         difficulty=payload.difficulty,
+        priority=payload.priority,
         sub_goal_id=payload.sub_goal_id,
         is_private=payload.is_private,
         is_daily=payload.is_daily,
@@ -500,6 +501,8 @@ def update_task(task_id: UUID, payload: TaskUpdate, current_user: User = Depends
         task.title = payload.title
     if payload.difficulty is not None:
         task.difficulty = payload.difficulty
+    if payload.priority is not None:
+        task.priority = payload.priority
     if payload.is_private is not None:
         task.is_private = payload.is_private
     if payload.is_daily is not None:
