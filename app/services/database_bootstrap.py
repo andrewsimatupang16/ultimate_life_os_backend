@@ -14,12 +14,20 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import Base, DATABASE_URL, engine
 from app import models  # noqa: F401 - ensure all models are registered
 
 logger = logging.getLogger("life_os.database")
+
+
+def _safe_database_url() -> str:
+    try:
+        return str(make_url(DATABASE_URL).render_as_string(hide_password=True))
+    except Exception:
+        return "<configured>"
 
 
 def _truthy_env(name: str, default: str = "true") -> bool:
@@ -149,7 +157,7 @@ def _run_alembic_upgrade() -> None:
     alembic_config = Config(str(config_path))
     alembic_config.set_main_option("sqlalchemy.url", DATABASE_URL)
     command.upgrade(alembic_config, "head")
-    logger.info("database_alembic_upgrade_applied url=%s", DATABASE_URL)
+    logger.info("database_alembic_upgrade_applied url=%s", _safe_database_url())
 
 
 def ensure_database_ready() -> None:
@@ -162,7 +170,7 @@ def ensure_database_ready() -> None:
         if _migration_mode() == "legacy_sql":
             try:
                 Base.metadata.create_all(bind=engine)
-                logger.info("database_tables_checked url=%s", DATABASE_URL)
+                logger.info("database_tables_checked url=%s", _safe_database_url())
             except SQLAlchemyError:
                 logger.exception("database_create_all_failed")
                 raise
@@ -172,8 +180,8 @@ def ensure_database_ready() -> None:
     else:
         try:
             Base.metadata.create_all(bind=engine)
-            logger.info("database_tables_checked url=%s", DATABASE_URL)
+            logger.info("database_tables_checked url=%s", _safe_database_url())
         except SQLAlchemyError:
             logger.exception("database_create_all_failed")
             raise
-        logger.info("database_migrations_skipped reason=non_postgres url=%s", DATABASE_URL)
+        logger.info("database_migrations_skipped reason=non_postgres url=%s", _safe_database_url())

@@ -16,11 +16,15 @@ def build_database_url() -> str:
     3. Fallback SQLite lokal agar backend tetap bisa start untuk development
     """
     app_env = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "development")).lower()
+    is_hosted_runtime = any(os.getenv(name) for name in ("SPACE_ID", "SPACE_HOST", "SPACE_AUTHOR_NAME"))
     if any("pytest" in arg for arg in sys.argv):
         return os.getenv("TEST_DATABASE_URL", "sqlite:///:memory:")
 
     database_url = os.getenv("DATABASE_URL")
     if database_url:
+        database_url = database_url.strip()
+        if database_url.startswith("postgres://"):
+            return database_url.replace("postgres://", "postgresql://", 1)
         return database_url
 
     db_user = os.getenv("DB_USER")
@@ -34,8 +38,11 @@ def build_database_url() -> str:
         safe_password = quote_plus(db_password)
         return f"postgresql+psycopg2://{safe_user}:{safe_password}@{db_host}:{db_port}/{db_name}"
 
-    if app_env in {"production", "prod", "staging"}:
-        raise RuntimeError("DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME must be set outside development")
+    if app_env in {"production", "prod", "staging"} or is_hosted_runtime:
+        raise RuntimeError(
+            "DATABASE_URL or DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME must be set for deployed backend. "
+            "Set DATABASE_URL to your Supabase PostgreSQL connection string."
+        )
 
     return "sqlite:///./life_os.db"
 
