@@ -257,6 +257,7 @@ class Task(Base):
     is_private = Column(Boolean, default=False)
     used_timer = Column(Boolean, default=False)
     is_daily = Column(Boolean, default=False)
+    recurrence_days = Column(String, nullable=True)
     due_date = Column(DateTime, nullable=True)
     last_generated_date = Column(Date, nullable=True)
     xp_rewarded = Column(Integer, default=0)

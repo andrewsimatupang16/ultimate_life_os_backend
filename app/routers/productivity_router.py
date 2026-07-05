@@ -115,6 +115,28 @@ def ensure_subgoal_unlocked(subgoal: SubGoal) -> None:
     ensure_goal_unlocked(subgoal.goal)
 
 
+def serialize_recurrence_days(days: list[int] | None) -> str | None:
+    if not days:
+        return None
+    normalized_days = sorted({int(day) for day in days if 0 <= int(day) <= 6})
+    return ",".join(str(day) for day in normalized_days) if normalized_days else None
+
+
+def parse_recurrence_days(value: str | None) -> set[int]:
+    if not value:
+        return set()
+    return {int(day) for day in value.split(",") if day.strip()}
+
+
+def task_runs_on_date(task: Task, target_date) -> bool:
+    if not task.is_daily:
+        return True
+    recurrence_days = parse_recurrence_days(task.recurrence_days)
+    if not recurrence_days:
+        return True
+    return target_date.weekday() in recurrence_days
+
+
 def reset_daily_task_for_today(user: User, task: Task) -> bool:
     if not task.is_daily:
         return False
@@ -122,6 +144,9 @@ def reset_daily_task_for_today(user: User, task: Task) -> bool:
         return False
 
     today = local_date_for_user(user)
+    if not task_runs_on_date(task, today):
+        return False
+
     cycle_date = task.last_generated_date
     if cycle_date is None and task.completed_at is not None:
         cycle_date = local_date_for_user(user, task.completed_at)
@@ -461,6 +486,9 @@ def create_task(payload: TaskCreate, current_user: User = Depends(get_current_us
         if not subgoal:
             raise HTTPException(status_code=404, detail="Sub-goal not found")
         ensure_subgoal_unlocked(subgoal)
+    recurrence_days = serialize_recurrence_days(payload.recurrence_days) if payload.is_daily else None
+    today = local_date_for_user(current_user)
+    runs_today = not payload.is_daily or not recurrence_days or today.weekday() in parse_recurrence_days(recurrence_days)
     task = Task(
         user_id=current_user.id,
         title=payload.title,
@@ -469,8 +497,9 @@ def create_task(payload: TaskCreate, current_user: User = Depends(get_current_us
         sub_goal_id=payload.sub_goal_id,
         is_private=payload.is_private,
         is_daily=payload.is_daily,
+        recurrence_days=recurrence_days,
         due_date=payload.due_date,
-        last_generated_date=local_date_for_user(current_user) if payload.is_daily else None,
+        last_generated_date=today if payload.is_daily and runs_today else None,
     )
     db.add(task)
     db.commit()
@@ -511,6 +540,9 @@ def update_task(task_id: UUID, payload: TaskUpdate, current_user: User = Depends
             task.last_generated_date = task.last_generated_date or local_date_for_user(current_user)
         else:
             task.last_generated_date = None
+            task.recurrence_days = None
+    if "recurrence_days" in payload.model_fields_set:
+        task.recurrence_days = serialize_recurrence_days(payload.recurrence_days) if task.is_daily else None
     if payload.used_timer is not None:
         task.used_timer = payload.used_timer
     if "due_date" in payload.model_fields_set:

@@ -44,6 +44,21 @@ def strip_optional_string(value):
     return value
 
 
+def normalize_weekday_list(value):
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        parts = list(value)
+
+    days = sorted({int(day) for day in parts})
+    invalid_days = [day for day in days if day < 0 or day > 6]
+    if invalid_days:
+        raise ValueError("recurrence_days must contain weekday numbers from 0 to 6")
+    return days
+
+
 def normalize_email_value(value):
     if value is None:
         return value
@@ -343,12 +358,18 @@ class TaskCreate(DateTimeInputSchema):
     sub_goal_id: Optional[UUID] = None
     is_private: bool = False
     is_daily: bool = False
+    recurrence_days: List[int] = Field(default_factory=list)
     due_date: Optional[datetime] = None
 
     @field_validator("title", mode="before")
     @classmethod
     def normalize_title(cls, value):
         return strip_non_empty_string(value, "title")
+
+    @field_validator("recurrence_days", mode="before")
+    @classmethod
+    def normalize_recurrence_days(cls, value):
+        return normalize_weekday_list(value)
 
 
 class TaskUpdate(DateTimeInputSchema):
@@ -359,6 +380,7 @@ class TaskUpdate(DateTimeInputSchema):
     is_private: Optional[bool] = None
     used_timer: Optional[bool] = None
     is_daily: Optional[bool] = None
+    recurrence_days: Optional[List[int]] = None
     due_date: Optional[datetime] = None
     sub_goal_id: Optional[UUID] = None
 
@@ -366,6 +388,11 @@ class TaskUpdate(DateTimeInputSchema):
     @classmethod
     def normalize_title(cls, value):
         return strip_non_empty_string(value, "title")
+
+    @field_validator("recurrence_days", mode="before")
+    @classmethod
+    def normalize_recurrence_days(cls, value):
+        return normalize_weekday_list(value)
 
 
 class TaskResponse(BaseSchema):
@@ -379,10 +406,16 @@ class TaskResponse(BaseSchema):
     is_private: bool = False
     used_timer: bool = False
     is_daily: bool = False
+    recurrence_days: List[int] = Field(default_factory=list)
     due_date: Optional[datetime] = None
     last_generated_date: Optional[date] = None
     xp_rewarded: int = 0
     coin_rewarded: int = 0
+
+    @field_validator("recurrence_days", mode="before")
+    @classmethod
+    def normalize_recurrence_days(cls, value):
+        return normalize_weekday_list(value)
 
 
 class HabitCreate(BaseModel):

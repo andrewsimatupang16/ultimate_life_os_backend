@@ -4,6 +4,13 @@ from app.models import Goal, Habit, SubGoal, Task
 from app.utils.time import utc_now
 
 
+def serialize_recurrence_days(days):
+    if not days:
+        return None
+    normalized_days = sorted({int(day) for day in days if 0 <= int(day) <= 6})
+    return ",".join(str(day) for day in normalized_days) if normalized_days else None
+
+
 class ProductivityService:
     @staticmethod
     def create_task(db: Session, user_id, data):
@@ -15,6 +22,7 @@ class ProductivityService:
             sub_goal_id=data.sub_goal_id,
             is_private=data.is_private,
             is_daily=data.is_daily,
+            recurrence_days=serialize_recurrence_days(getattr(data, "recurrence_days", None)) if data.is_daily else None,
             is_completed=False,
         )
         db.add(task)
