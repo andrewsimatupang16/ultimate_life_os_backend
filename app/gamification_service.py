@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import date, timedelta
 from sqlalchemy.orm import Session
 from app.models import (
     User, CoinLedger, CoinLedgerTypeEnum,
@@ -401,39 +401,106 @@ class GamificationService:
     # =========================================================================
 
     @classmethod
-    def log_good_habit(cls, db: Session, user: User, habit: Habit) -> dict:
-        """Log good habit dan berikan reward."""
-        now = utc_now()
-        today = local_date_for_user(user, now)
+    def recalculate_habit_summary(cls, db: Session, user: User, habit: Habit) -> None:
+        """Hitung ulang ringkasan habit dari log aktif agar klik tanggal lampau tetap konsisten."""
+        logs = (
+            db.query(HabitLog)
+            .filter(
+                HabitLog.user_id == user.id,
+                HabitLog.habit_id == habit.id,
+                HabitLog.deleted_at.is_(None),
+            )
+            .order_by(HabitLog.local_date.asc(), HabitLog.logged_at.asc())
+            .all()
+        )
+        logged_dates = sorted({log.local_date for log in logs})
+        habit.total_completions = len(logged_dates)
 
-        # Cek apakah sudah log hari ini
+        if not logged_dates:
+            habit.current_streak = 0
+            habit.best_streak = 0
+            habit.last_logged_at = None
+            return
+
+        best_streak = 0
+        running_streak = 0
+        previous_date = None
+        for logged_date in logged_dates:
+            if previous_date is not None and logged_date == previous_date + timedelta(days=1):
+                running_streak += 1
+            else:
+                running_streak = 1
+            best_streak = max(best_streak, running_streak)
+            previous_date = logged_date
+
+        latest_date = logged_dates[-1]
+        current_streak = 0
+        expected_date = latest_date
+        for logged_date in reversed(logged_dates):
+            if logged_date != expected_date:
+                break
+            current_streak += 1
+            expected_date = expected_date - timedelta(days=1)
+
+        latest_log = max(
+            (log for log in logs if log.local_date == latest_date),
+            key=lambda log: log.logged_at,
+        )
+        habit.current_streak = current_streak
+        habit.best_streak = best_streak
+        habit.last_logged_at = latest_log.logged_at
+
+    @classmethod
+    def habit_streak_after_logging_date(cls, db: Session, user: User, habit: Habit, target_date: date) -> int:
+        logged_dates = {
+            row[0]
+            for row in db.query(HabitLog.local_date).filter(
+                HabitLog.user_id == user.id,
+                HabitLog.habit_id == habit.id,
+                HabitLog.local_date < target_date,
+                HabitLog.deleted_at.is_(None),
+            ).all()
+        }
+        streak = 1
+        cursor = target_date - timedelta(days=1)
+        while cursor in logged_dates:
+            streak += 1
+            cursor = cursor - timedelta(days=1)
+        return streak
+
+    @classmethod
+    def log_good_habit(cls, db: Session, user: User, habit: Habit, *, target_date: date | None = None) -> dict:
+        """Log good habit pada tanggal lokal tertentu dan berikan reward."""
+        now = utc_now()
+        local_today = local_date_for_user(user, now)
+        log_date = target_date or local_today
+
+        if log_date > local_today:
+            return {
+                "success": False,
+                "message": "Tanggal masa depan belum bisa dicatat.",
+                "xp_earned": 0,
+                "coins_earned": 0,
+            }
+
         existing_log = db.query(HabitLog).filter(
             HabitLog.habit_id == habit.id,
-            HabitLog.local_date == today,
+            HabitLog.local_date == log_date,
             HabitLog.deleted_at.is_(None),
         ).first()
         if existing_log:
             return {
                 "success": False,
-                "message": "Already logged today",
+                "message": "Habit sudah dicatat pada tanggal ini.",
                 "xp_earned": 0,
                 "coins_earned": 0,
             }
 
-        previous_date = local_date_for_user(user, habit.last_logged_at) if habit.last_logged_at else None
-        habit.last_logged_at = now
-        if previous_date == today - timedelta(days=1):
-            habit.current_streak += 1
-        else:
-            habit.current_streak = 1
-        habit.total_completions += 1
-        if habit.current_streak > habit.best_streak:
-            habit.best_streak = habit.current_streak
+        streak_after_log = cls.habit_streak_after_logging_date(db, user, habit, log_date)
 
-        # Hitung reward dengan streak bonus
         base_xp = GamificationConfig.GOOD_HABIT_DAILY["xp"]
         base_coins = GamificationConfig.GOOD_HABIT_DAILY["coins"]
-        streak_bonus = 1 + (habit.current_streak * GamificationConfig.GOOD_HABIT_STREAK_BONUS_MULTIPLIER)
+        streak_bonus = 1 + (streak_after_log * GamificationConfig.GOOD_HABIT_STREAK_BONUS_MULTIPLIER)
 
         xp = int(base_xp * streak_bonus)
         coins = int(base_coins * streak_bonus)
@@ -446,19 +513,19 @@ class GamificationService:
             source_id=habit.id,
             xp_delta=xp,
             coin_delta=coins,
-            event_date=today,
+            event_date=log_date,
             description=f"Good habit: {habit.title}",
         )
         if event is None:
             return {
                 "success": False,
-                "message": "Already logged today",
+                "message": "Habit sudah dicatat pada tanggal ini.",
                 "xp_earned": 0,
                 "coins_earned": 0,
             }
 
         level_info = cls.add_xp_and_check_level_up(db, user, xp)
-        cls.add_coins(db, user, coins, f"Good habit: {habit.title} (streak: {habit.current_streak})")
+        cls.add_coins(db, user, coins, f"Good habit: {habit.title} (streak: {streak_after_log})")
 
         habit.xp_rewarded += xp
         habit.coin_rewarded += coins
@@ -466,12 +533,14 @@ class GamificationService:
             user_id=user.id,
             habit_id=habit.id,
             habit_type=habit.habit_type,
-            local_date=today,
+            local_date=log_date,
             logged_at=now,
             xp_earned=xp,
             coin_earned=coins,
             penalty=0,
         ))
+        db.flush()
+        cls.recalculate_habit_summary(db, user, habit)
 
         return {
             "success": True,
@@ -486,16 +555,17 @@ class GamificationService:
 
 
     @classmethod
-    def calculate_bad_habit_penalty(cls, db: Session, user: User, habit: Habit, *, now=None) -> dict:
+    def calculate_bad_habit_penalty(cls, db: Session, user: User, habit: Habit, *, now=None, target_date: date | None = None) -> dict:
         """Return the next penalty for a bad habit from central gamification config."""
         reference_now = now or utc_now()
-        today = local_date_for_user(user, reference_now)
-        window_start = today - timedelta(days=GamificationConfig.BAD_HABIT_REVIEW_WINDOW_DAYS)
+        reference_date = target_date or local_date_for_user(user, reference_now)
+        window_start = reference_date - timedelta(days=GamificationConfig.BAD_HABIT_REVIEW_WINDOW_DAYS)
 
         recent_penalty_count = db.query(HabitLog).filter(
             HabitLog.user_id == user.id,
             HabitLog.habit_id == habit.id,
             HabitLog.local_date >= window_start,
+            HabitLog.local_date <= reference_date,
             HabitLog.penalty > 0,
             HabitLog.deleted_at.is_(None),
         ).count()
@@ -520,33 +590,34 @@ class GamificationService:
         }
 
     @classmethod
-    def log_bad_habit(cls, db: Session, user: User, habit: Habit) -> dict:
-        """Log bad habit dan aplikasikan penalty."""
+    def log_bad_habit(cls, db: Session, user: User, habit: Habit, *, target_date: date | None = None) -> dict:
+        """Log bad habit pada tanggal lokal tertentu dan aplikasikan penalty."""
         now = utc_now()
-        today = local_date_for_user(user, now)
+        local_today = local_date_for_user(user, now)
+        log_date = target_date or local_today
 
-        # Cek apakah sudah log hari ini
+        if log_date > local_today:
+            return {
+                "success": False,
+                "message": "Tanggal masa depan belum bisa dicatat.",
+                "penalty": 0,
+            }
+
         existing_log = db.query(HabitLog).filter(
             HabitLog.habit_id == habit.id,
-            HabitLog.local_date == today,
+            HabitLog.local_date == log_date,
             HabitLog.deleted_at.is_(None),
         ).first()
         if existing_log:
             return {
                 "success": False,
-                "message": "Already logged today",
+                "message": "Habit sudah dicatat pada tanggal ini.",
                 "penalty": 0,
             }
 
-        penalty_info = cls.calculate_bad_habit_penalty(db, user, habit, now=now)
+        penalty_info = cls.calculate_bad_habit_penalty(db, user, habit, now=now, target_date=log_date)
         final_penalty = penalty_info["penalty"]
 
-        # Update habit
-        habit.last_logged_at = now
-        habit.current_streak += 1
-        habit.total_completions += 1
-
-        # Apply penalty
         cls.record_event(
             db,
             user,
@@ -555,7 +626,7 @@ class GamificationService:
             source_id=habit.id,
             xp_delta=0,
             coin_delta=-final_penalty,
-            event_date=today,
+            event_date=log_date,
             description=f"Bad habit: {habit.title}",
         )
         cls.apply_penalty(db, user, final_penalty, f"Bad habit: {habit.title}")
@@ -563,12 +634,14 @@ class GamificationService:
             user_id=user.id,
             habit_id=habit.id,
             habit_type=habit.habit_type,
-            local_date=today,
+            local_date=log_date,
             logged_at=now,
             xp_earned=0,
             coin_earned=0,
             penalty=final_penalty,
         ))
+        db.flush()
+        cls.recalculate_habit_summary(db, user, habit)
 
         return {
             "success": True,

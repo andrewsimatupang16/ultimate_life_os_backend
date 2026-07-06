@@ -23,6 +23,7 @@ class ProductivityService:
             is_private=data.is_private,
             is_daily=data.is_daily,
             recurrence_days=serialize_recurrence_days(getattr(data, "recurrence_days", None)) if data.is_daily else None,
+            start_date=getattr(data, "start_date", None),
             is_completed=False,
         )
         db.add(task)

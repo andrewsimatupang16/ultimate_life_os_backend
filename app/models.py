@@ -139,6 +139,7 @@ class User(Base):
 
     goals = relationship("Goal", back_populates="user", cascade="all, delete-orphan")
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
+    task_occurrence_skips = relationship("TaskOccurrenceSkip", back_populates="user", cascade="all, delete-orphan")
     habits = relationship("Habit", back_populates="user", cascade="all, delete-orphan")
     wallets = relationship("Wallet", back_populates="user", cascade="all, delete-orphan")
     budgets = relationship("Budget", back_populates="user", cascade="all, delete-orphan")
@@ -258,6 +259,7 @@ class Task(Base):
     used_timer = Column(Boolean, default=False)
     is_daily = Column(Boolean, default=False)
     recurrence_days = Column(String, nullable=True)
+    start_date = Column(Date, nullable=True)
     due_date = Column(DateTime, nullable=True)
     last_generated_date = Column(Date, nullable=True)
     xp_rewarded = Column(Integer, default=0)
@@ -269,6 +271,28 @@ class Task(Base):
 
     user = relationship("User", back_populates="tasks")
     sub_goal = relationship("SubGoal", back_populates="tasks")
+    occurrence_skips = relationship("TaskOccurrenceSkip", back_populates="task", cascade="all, delete-orphan")
+
+
+class TaskOccurrenceSkip(Base):
+    __tablename__ = "task_occurrence_skips"
+    __table_args__ = (
+        UniqueConstraint("task_id", "local_date", name="uq_task_occurrence_skips_task_local_date"),
+        Index("ix_task_occurrence_skips_user_local_date", "user_id", "local_date"),
+    )
+
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4, index=True)
+    user_id = Column(GUID(), ForeignKey("users.id"), nullable=False)
+    task_id = Column(GUID(), ForeignKey("tasks.id"), nullable=False)
+    local_date = Column(Date, nullable=False)
+    skipped_at = Column(DateTime, default=utc_now)
+
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+    deleted_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="task_occurrence_skips")
+    task = relationship("Task", back_populates="occurrence_skips")
 
 
 # =============================================================================

@@ -1,3 +1,4 @@
+from datetime import date
 from typing import List
 from uuid import UUID
 
@@ -7,7 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.gamification_service import GamificationService
-from app.models import Goal, Habit, HabitLog, HabitTypeEnum, KeyResultHistory, SubGoal, Task, User
+from app.models import Goal, Habit, HabitLog, HabitTypeEnum, KeyResultHistory, SubGoal, Task, TaskOccurrenceSkip, User
 from app.schemas import (
     CompletionRewardResponse,
     GoalCreate,
@@ -15,6 +16,7 @@ from app.schemas import (
     GoalUpdate,
     HabitCreate,
     HabitHistoryItem,
+    HabitLogDateRequest,
     HabitLogResponse,
     HabitResponse,
     HabitUpdate,
@@ -128,6 +130,10 @@ def parse_recurrence_days(value: str | None) -> set[int]:
     return {int(day) for day in value.split(",") if day.strip()}
 
 
+def task_has_started(task: Task, target_date) -> bool:
+    return task.start_date is None or task.start_date <= target_date
+
+
 def task_runs_on_date(task: Task, target_date) -> bool:
     if not task.is_daily:
         return True
@@ -144,6 +150,8 @@ def reset_daily_task_for_today(user: User, task: Task) -> bool:
         return False
 
     today = local_date_for_user(user)
+    if not task_has_started(task, today):
+        return False
     if not task_runs_on_date(task, today):
         return False
 
@@ -183,7 +191,78 @@ def reset_daily_tasks_for_today(db: Session, user: User) -> None:
         db.commit()
 
 
-def goal_to_dict(goal: Goal) -> dict:
+def skipped_task_ids_for_today(db: Session, user: User) -> set[UUID]:
+    today = local_date_for_user(user)
+    return {
+        row[0]
+        for row in db.query(TaskOccurrenceSkip.task_id).filter(
+            TaskOccurrenceSkip.user_id == user.id,
+            TaskOccurrenceSkip.local_date == today,
+            TaskOccurrenceSkip.deleted_at.is_(None),
+        ).all()
+    }
+
+
+def task_is_skipped_today(db: Session, user: User, task: Task) -> bool:
+    today = local_date_for_user(user)
+    return db.query(TaskOccurrenceSkip.id).filter(
+        TaskOccurrenceSkip.user_id == user.id,
+        TaskOccurrenceSkip.task_id == task.id,
+        TaskOccurrenceSkip.local_date == today,
+        TaskOccurrenceSkip.deleted_at.is_(None),
+    ).first() is not None
+
+
+def skip_daily_task_for_today(db: Session, user: User, task: Task) -> None:
+    today = local_date_for_user(user)
+    existing_skip = db.query(TaskOccurrenceSkip).filter(
+        TaskOccurrenceSkip.user_id == user.id,
+        TaskOccurrenceSkip.task_id == task.id,
+        TaskOccurrenceSkip.local_date == today,
+    ).first()
+
+    now = utc_now()
+    if existing_skip:
+        existing_skip.deleted_at = None
+        existing_skip.skipped_at = now
+        existing_skip.updated_at = now
+        return
+
+    db.add(TaskOccurrenceSkip(
+        user_id=user.id,
+        task_id=task.id,
+        local_date=today,
+        skipped_at=now,
+    ))
+
+
+def recalculate_daily_task_cycle_for_today(user: User, task: Task) -> None:
+    if not task.is_daily:
+        task.last_generated_date = None
+        return
+
+    today = local_date_for_user(user)
+    if task_has_started(task, today) and task_runs_on_date(task, today):
+        task.last_generated_date = task.last_generated_date or today
+        return
+
+    task.last_generated_date = None
+
+
+def task_visible_on_date(task: Task, target_date, skipped_task_ids: set[UUID]) -> bool:
+    if task.id in skipped_task_ids:
+        return False
+    if not task_has_started(task, target_date):
+        return False
+    return task_runs_on_date(task, target_date)
+
+
+def filter_tasks_visible_today(tasks: list[Task], skipped_task_ids: set[UUID], today) -> list[Task]:
+    target_date = today
+    return [task for task in tasks if task_visible_on_date(task, target_date, skipped_task_ids)]
+
+
+def goal_to_dict(goal: Goal, skipped_task_ids: set[UUID] | None = None, today=None) -> dict:
     data = GoalResponse.model_validate(goal).model_dump(mode="json")
     data["progress_rate"] = goal_weighted_progress(goal)
     data["status"] = "Completed" if goal.is_completed else "In Progress"
@@ -192,9 +271,19 @@ def goal_to_dict(goal: Goal) -> dict:
         sg_data = SubGoalResponse.model_validate(sg).model_dump(mode="json")
         sg_data["progress_rate"] = subgoal_progress(sg)
         sg_data["is_locked"] = bool(goal.is_completed)
+        target_date = today
+        skipped_ids = skipped_task_ids or set()
         sg_data["tasks"] = [
             TaskResponse.model_validate(t).model_dump(mode="json")
-            for t in sorted([task for task in sg.tasks if task.deleted_at is None], key=lambda task: task.created_at)
+            for t in sorted(
+                [
+                    task
+                    for task in sg.tasks
+                    if task.deleted_at is None
+                    and (target_date is None or task_visible_on_date(task, target_date, skipped_ids))
+                ],
+                key=lambda task: task.created_at,
+            )
         ]
         data["sub_goals"].append(sg_data)
     return data
@@ -214,7 +303,9 @@ def get_goals(current_user: User = Depends(get_current_user), db: Session = Depe
         Goal.user_id == current_user.id,
         Goal.deleted_at.is_(None),
     ).order_by(Goal.is_completed.asc(), Goal.target_date.asc().nullslast(), Goal.created_at.asc()).all()
-    return [goal_to_dict(g) for g in goals]
+    skipped_task_ids = skipped_task_ids_for_today(db, current_user)
+    today = local_date_for_user(current_user)
+    return [goal_to_dict(g, skipped_task_ids, today) for g in goals]
 
 
 @router.get("/goals/{goal_id}")
@@ -226,7 +317,9 @@ def get_goal(goal_id: UUID, current_user: User = Depends(get_current_user), db: 
     ).first()
     if not goal:
         raise HTTPException(status_code=404, detail="Goal not found")
-    return goal_to_dict(goal)
+    skipped_task_ids = skipped_task_ids_for_today(db, current_user)
+    today = local_date_for_user(current_user)
+    return goal_to_dict(goal, skipped_task_ids, today)
 
 
 @router.post("/goals", response_model=GoalResponse, status_code=status.HTTP_201_CREATED)
@@ -470,13 +563,36 @@ def get_subgoal_history(subgoal_id: UUID, current_user: User = Depends(get_curre
 @router.get("/tasks", response_model=List[TaskResponse])
 def get_tasks(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     reset_daily_tasks_for_today(db, current_user)
-    return db.query(Task).filter(Task.user_id == current_user.id, Task.deleted_at.is_(None)).order_by(Task.created_at.desc()).all()
+    skipped_task_ids = skipped_task_ids_for_today(db, current_user)
+    today = local_date_for_user(current_user)
+    tasks = db.query(Task).filter(
+        Task.user_id == current_user.id,
+        Task.deleted_at.is_(None),
+    ).order_by(Task.created_at.desc()).all()
+    return filter_tasks_visible_today(tasks, skipped_task_ids, today)
 
 
 @router.get("/tasks/standalone", response_model=List[TaskResponse])
 def get_standalone_tasks(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     reset_daily_tasks_for_today(db, current_user)
-    return db.query(Task).filter(Task.user_id == current_user.id, Task.sub_goal_id.is_(None), Task.deleted_at.is_(None)).order_by(Task.created_at.desc()).all()
+    skipped_task_ids = skipped_task_ids_for_today(db, current_user)
+    today = local_date_for_user(current_user)
+    tasks = db.query(Task).filter(
+        Task.user_id == current_user.id,
+        Task.sub_goal_id.is_(None),
+        Task.deleted_at.is_(None),
+    ).order_by(Task.created_at.desc()).all()
+    return filter_tasks_visible_today(tasks, skipped_task_ids, today)
+
+
+@router.get("/tasks/recurring", response_model=List[TaskResponse])
+def get_recurring_tasks(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return the saved recurring task masters, not today's filtered occurrences."""
+    return db.query(Task).filter(
+        Task.user_id == current_user.id,
+        Task.is_daily.is_(True),
+        Task.deleted_at.is_(None),
+    ).order_by(Task.created_at.desc()).all()
 
 
 @router.post("/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
@@ -488,7 +604,11 @@ def create_task(payload: TaskCreate, current_user: User = Depends(get_current_us
         ensure_subgoal_unlocked(subgoal)
     recurrence_days = serialize_recurrence_days(payload.recurrence_days) if payload.is_daily else None
     today = local_date_for_user(current_user)
-    runs_today = not payload.is_daily or not recurrence_days or today.weekday() in parse_recurrence_days(recurrence_days)
+    start_date = payload.start_date or today
+    runs_today = (
+        start_date <= today
+        and (not payload.is_daily or not recurrence_days or today.weekday() in parse_recurrence_days(recurrence_days))
+    )
     task = Task(
         user_id=current_user.id,
         title=payload.title,
@@ -498,6 +618,7 @@ def create_task(payload: TaskCreate, current_user: User = Depends(get_current_us
         is_private=payload.is_private,
         is_daily=payload.is_daily,
         recurrence_days=recurrence_days,
+        start_date=start_date,
         due_date=payload.due_date,
         last_generated_date=today if payload.is_daily and runs_today else None,
     )
@@ -513,6 +634,8 @@ def update_task(task_id: UUID, payload: TaskUpdate, current_user: User = Depends
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     reset_daily_task_for_today(current_user, task)
+    if task_is_skipped_today(db, current_user, task):
+        raise HTTPException(status_code=404, detail="Task not found for today")
     if task.sub_goal:
         ensure_subgoal_unlocked(task.sub_goal)
     if task.is_completed:
@@ -536,13 +659,13 @@ def update_task(task_id: UUID, payload: TaskUpdate, current_user: User = Depends
         task.is_private = payload.is_private
     if payload.is_daily is not None:
         task.is_daily = payload.is_daily
-        if payload.is_daily:
-            task.last_generated_date = task.last_generated_date or local_date_for_user(current_user)
-        else:
-            task.last_generated_date = None
+        if not payload.is_daily:
             task.recurrence_days = None
     if "recurrence_days" in payload.model_fields_set:
         task.recurrence_days = serialize_recurrence_days(payload.recurrence_days) if task.is_daily else None
+    if "start_date" in payload.model_fields_set:
+        task.start_date = payload.start_date or local_date_for_user(current_user)
+    recalculate_daily_task_cycle_for_today(current_user, task)
     if payload.used_timer is not None:
         task.used_timer = payload.used_timer
     if "due_date" in payload.model_fields_set:
@@ -570,6 +693,9 @@ def complete_task(task_id: UUID, current_user: User = Depends(get_current_user),
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     reset_daily_task_for_today(current_user, task)
+    today = local_date_for_user(current_user)
+    if not task_visible_on_date(task, today, set()) or task_is_skipped_today(db, current_user, task):
+        raise HTTPException(status_code=404, detail="Task not found for today")
     if task.sub_goal:
         ensure_subgoal_unlocked(task.sub_goal)
     if task.is_completed:
@@ -599,7 +725,15 @@ def delete_task(task_id: UUID, current_user: User = Depends(get_current_user), d
         ensure_subgoal_unlocked(task.sub_goal)
     if task.is_completed:
         raise HTTPException(status_code=409, detail="Task is completed and locked")
+
     now = utc_now()
+    today = local_date_for_user(current_user)
+    if task.is_daily and task_visible_on_date(task, today, set()):
+        skip_daily_task_for_today(db, current_user, task)
+        task.updated_at = now
+        db.commit()
+        return None
+
     task.deleted_at = now
     task.updated_at = now
     db.commit()
@@ -683,19 +817,28 @@ def update_habit(habit_id: UUID, payload: HabitUpdate, current_user: User = Depe
     return habit
 
 
-@router.post("/habits/{habit_id}/log", response_model=HabitLogResponse)
-def log_habit(habit_id: UUID, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def log_habit_for_date(
+    habit_id: UUID,
+    target_date: date | None,
+    current_user: User,
+    db: Session,
+) -> HabitLogResponse:
     habit = db.query(Habit).filter(Habit.id == habit_id, Habit.user_id == current_user.id, Habit.deleted_at.is_(None)).first()
     if not habit:
         raise HTTPException(status_code=404, detail="Habit not found")
+
+    if target_date is not None and target_date > local_date_for_user(current_user):
+        raise HTTPException(status_code=400, detail="Future habit dates cannot be logged")
+
     if habit.habit_type == HabitTypeEnum.good:
-        result = GamificationService.log_good_habit(db, current_user, habit)
+        result = GamificationService.log_good_habit(db, current_user, habit, target_date=target_date)
         penalty = 0
     else:
-        result = GamificationService.log_bad_habit(db, current_user, habit)
+        result = GamificationService.log_bad_habit(db, current_user, habit, target_date=target_date)
         penalty = int(result.get("penalty", 0) or 0)
     db.commit()
     db.refresh(current_user)
+    db.refresh(habit)
     return HabitLogResponse(
         success=bool(result.get("success", True)),
         message=result.get("message", "Habit logged"),
@@ -705,6 +848,21 @@ def log_habit(habit_id: UUID, current_user: User = Depends(get_current_user), db
         new_streak=habit.current_streak,
         new_balance={"level": current_user.level, "xp": current_user.xp_balance, "coins": current_user.coin_balance},
     )
+
+
+@router.post("/habits/{habit_id}/log", response_model=HabitLogResponse)
+def log_habit(habit_id: UUID, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return log_habit_for_date(habit_id, None, current_user, db)
+
+
+@router.post("/habits/{habit_id}/log-date", response_model=HabitLogResponse)
+def log_habit_date(
+    habit_id: UUID,
+    payload: HabitLogDateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return log_habit_for_date(habit_id, payload.local_date, current_user, db)
 
 
 @router.get("/habits/{habit_id}/history", response_model=List[HabitHistoryItem])

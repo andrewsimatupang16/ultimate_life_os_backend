@@ -359,6 +359,7 @@ class TaskCreate(DateTimeInputSchema):
     is_private: bool = False
     is_daily: bool = False
     recurrence_days: List[int] = Field(default_factory=list)
+    start_date: Optional[date] = None
     due_date: Optional[datetime] = None
 
     @field_validator("title", mode="before")
@@ -381,6 +382,7 @@ class TaskUpdate(DateTimeInputSchema):
     used_timer: Optional[bool] = None
     is_daily: Optional[bool] = None
     recurrence_days: Optional[List[int]] = None
+    start_date: Optional[date] = None
     due_date: Optional[datetime] = None
     sub_goal_id: Optional[UUID] = None
 
@@ -407,6 +409,7 @@ class TaskResponse(BaseSchema):
     used_timer: bool = False
     is_daily: bool = False
     recurrence_days: List[int] = Field(default_factory=list)
+    start_date: Optional[date] = None
     due_date: Optional[datetime] = None
     last_generated_date: Optional[date] = None
     xp_rewarded: int = 0
@@ -469,6 +472,10 @@ class HabitResponse(BaseSchema):
     bad_habit_penalty_window_days: int = 0
     bad_habit_recent_penalty_count: int = 0
     bad_habit_penalty_multiplier_active: bool = False
+
+
+class HabitLogDateRequest(BaseModel):
+    local_date: date
 
 
 class HabitLogResponse(BaseModel):
