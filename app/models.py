@@ -305,6 +305,7 @@ class Habit(Base):
     id = Column(GUID(), primary_key=True, default=uuid.uuid4, index=True)
     user_id = Column(GUID(), ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
     habit_type = Column(Enum(HabitTypeEnum, native_enum=False), nullable=False)
     current_streak = Column(Integer, default=0)
     best_streak = Column(Integer, default=0)

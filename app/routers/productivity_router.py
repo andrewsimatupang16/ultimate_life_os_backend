@@ -791,6 +791,7 @@ def create_habit(payload: HabitCreate, current_user: User = Depends(get_current_
     habit = Habit(
         user_id=current_user.id,
         title=payload.title,
+        description=payload.description,
         habit_type=payload.habit_type,
         reminder_time=payload.reminder_time,
     )
@@ -807,6 +808,8 @@ def update_habit(habit_id: UUID, payload: HabitUpdate, current_user: User = Depe
         raise HTTPException(status_code=404, detail="Habit not found")
     if payload.title is not None:
         habit.title = payload.title
+    if "description" in payload.model_fields_set:
+        habit.description = payload.description
     if payload.habit_type is not None:
         habit.habit_type = payload.habit_type
     if "reminder_time" in payload.model_fields_set:
@@ -863,6 +866,43 @@ def log_habit_date(
     db: Session = Depends(get_db),
 ):
     return log_habit_for_date(habit_id, payload.local_date, current_user, db)
+
+
+@router.delete("/habits/{habit_id}/log-date/{local_date}", response_model=HabitLogResponse)
+def delete_habit_log_date(
+    habit_id: UUID,
+    local_date: date,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    habit = db.query(Habit).filter(
+        Habit.id == habit_id,
+        Habit.user_id == current_user.id,
+        Habit.deleted_at.is_(None),
+    ).first()
+    if not habit:
+        raise HTTPException(status_code=404, detail="Habit not found")
+
+    if local_date > local_date_for_user(current_user):
+        raise HTTPException(status_code=400, detail="Future habit dates cannot be changed")
+
+    result = GamificationService.remove_habit_log_for_date(db, current_user, habit, local_date)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=result.get("message", "Habit log not found"))
+
+    db.commit()
+    db.refresh(current_user)
+    db.refresh(habit)
+
+    return HabitLogResponse(
+        success=True,
+        message=result.get("message", "Isian habit dihapus."),
+        xp_earned=-int(result.get("xp_removed", 0) or 0),
+        coins_earned=-int(result.get("coins_removed", 0) or 0),
+        penalty=-int(result.get("penalty_refunded", 0) or 0),
+        new_streak=habit.current_streak,
+        new_balance={"level": current_user.level, "xp": current_user.xp_balance, "coins": current_user.coin_balance},
+    )
 
 
 @router.get("/habits/{habit_id}/history", response_model=List[HabitHistoryItem])

@@ -423,6 +423,7 @@ class TaskResponse(BaseSchema):
 
 class HabitCreate(BaseModel):
     title: str
+    description: Optional[str] = None
     habit_type: HabitTypeEnum
     reminder_time: Optional[str] = None
 
@@ -430,6 +431,11 @@ class HabitCreate(BaseModel):
     @classmethod
     def normalize_title(cls, value):
         return strip_non_empty_string(value, "title")
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def normalize_description(cls, value):
+        return strip_optional_string(value)
 
     @field_validator("reminder_time", mode="before")
     @classmethod
@@ -439,6 +445,7 @@ class HabitCreate(BaseModel):
 
 class HabitUpdate(BaseModel):
     title: Optional[str] = None
+    description: Optional[str] = None
     habit_type: Optional[HabitTypeEnum] = None
     reminder_time: Optional[str] = None
 
@@ -446,6 +453,11 @@ class HabitUpdate(BaseModel):
     @classmethod
     def normalize_title(cls, value):
         return strip_non_empty_string(value, "title")
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def normalize_description(cls, value):
+        return strip_optional_string(value)
 
     @field_validator("reminder_time", mode="before")
     @classmethod
@@ -456,6 +468,7 @@ class HabitUpdate(BaseModel):
 class HabitResponse(BaseSchema):
     user_id: UUID
     title: str
+    description: Optional[str] = None
     habit_type: HabitTypeEnum
     current_streak: int = 0
     best_streak: int = 0

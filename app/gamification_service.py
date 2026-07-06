@@ -469,6 +469,97 @@ class GamificationService:
         return streak
 
     @classmethod
+    def remove_xp(cls, user: User, amount: int) -> None:
+        """Kurangi XP user dengan aman, termasuk jika XP pernah menaikkan level."""
+        remaining = max(0, int(amount or 0))
+        if remaining <= 0:
+            return
+
+        user.total_xp_earned = max(0, (user.total_xp_earned or 0) - remaining)
+
+        while remaining > 0:
+            current_balance = user.xp_balance or 0
+            if current_balance >= remaining:
+                user.xp_balance = current_balance - remaining
+                return
+
+            remaining -= current_balance
+            if (user.level or 1) <= 1:
+                user.level = 1
+                user.xp_balance = 0
+                return
+
+            user.level -= 1
+            user.xp_balance = cls.xp_for_next_level(user.level)
+
+    @classmethod
+    def remove_habit_log_for_date(cls, db: Session, user: User, habit: Habit, target_date: date) -> dict:
+        """Hapus isian habit pada tanggal tertentu dan kembalikan ringkasan habit."""
+        habit_log = db.query(HabitLog).filter(
+            HabitLog.user_id == user.id,
+            HabitLog.habit_id == habit.id,
+            HabitLog.local_date == target_date,
+            HabitLog.deleted_at.is_(None),
+        ).first()
+
+        if not habit_log:
+            return {
+                "success": False,
+                "message": "Habit belum dicatat pada tanggal ini.",
+                "xp_removed": 0,
+                "coins_removed": 0,
+                "penalty_refunded": 0,
+            }
+
+        xp_removed = int(habit_log.xp_earned or 0)
+        coins_removed = int(habit_log.coin_earned or 0)
+        penalty_refunded = int(habit_log.penalty or 0)
+
+        if habit_log.habit_type == HabitTypeEnum.good:
+            cls.remove_xp(user, xp_removed)
+            user.coin_balance = max(0, (user.coin_balance or 0) - coins_removed)
+            habit.xp_rewarded = max(0, (habit.xp_rewarded or 0) - xp_removed)
+            habit.coin_rewarded = max(0, (habit.coin_rewarded or 0) - coins_removed)
+            if coins_removed > 0:
+                db.add(CoinLedger(
+                    user_id=user.id,
+                    transaction_type=CoinLedgerTypeEnum.spent,
+                    amount=coins_removed,
+                    source_description=f"Undo good habit: {habit.title}",
+                ))
+        else:
+            user.coin_balance = (user.coin_balance or 0) + penalty_refunded
+            if penalty_refunded > 0:
+                db.add(CoinLedger(
+                    user_id=user.id,
+                    transaction_type=CoinLedgerTypeEnum.earned,
+                    amount=penalty_refunded,
+                    source_description=f"Undo bad habit penalty: {habit.title}",
+                ))
+
+        event_type = "habit_log" if habit_log.habit_type == HabitTypeEnum.good else "habit_penalty"
+        event_key = cls.event_key(event_type, "habit", habit.id, target_date)
+        gamification_event = db.query(GamificationEvent).filter(
+            GamificationEvent.user_id == user.id,
+            GamificationEvent.event_key == event_key,
+        ).first()
+        if gamification_event:
+            db.delete(gamification_event)
+
+        # Hapus fisik agar tanggal yang sama bisa diisi lagi tanpa tabrakan unique constraint.
+        db.delete(habit_log)
+        db.flush()
+        cls.recalculate_habit_summary(db, user, habit)
+
+        return {
+            "success": True,
+            "message": "Isian habit dihapus.",
+            "xp_removed": xp_removed,
+            "coins_removed": coins_removed,
+            "penalty_refunded": penalty_refunded,
+        }
+
+    @classmethod
     def log_good_habit(cls, db: Session, user: User, habit: Habit, *, target_date: date | None = None) -> dict:
         """Log good habit pada tanggal lokal tertentu dan berikan reward."""
         now = utc_now()
