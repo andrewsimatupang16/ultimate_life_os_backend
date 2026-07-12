@@ -4,20 +4,24 @@ import os
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import case, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.gamification_service import GamificationService
+from app.routers.productivity_router import reset_daily_tasks_for_today
 from app.models import (
+    ActivityLog,
     BillReminder,
     Budget,
+    GamificationEvent,
     Goal,
     Habit,
     HabitLog,
     HabitTypeEnum,
     SubGoal,
     Task,
+    TaskOccurrenceSkip,
     Transaction,
     TransactionTypeEnum,
     User,
@@ -170,6 +174,248 @@ def pct_change(current: float, previous: float) -> float:
     return round(((current - previous) / previous) * 100, 2)
 
 
+def parse_task_recurrence_days(value: str | None) -> set[int]:
+    if not value:
+        return set()
+    days: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            day = int(item)
+        except ValueError:
+            continue
+        if 0 <= day <= 6:
+            days.add(day)
+    return days
+
+
+def iter_dates(start_date: date, end_date: date):
+    current = start_date
+    while current < end_date:
+        yield current
+        current += timedelta(days=1)
+
+
+def local_date_window_for_period(user: User, start_datetime: datetime, end_datetime: datetime) -> tuple[date, date]:
+    if end_datetime <= start_datetime:
+        local_start = local_date_for_user(user, start_datetime)
+        return local_start, local_start
+
+    local_start = local_date_for_user(user, start_datetime)
+    local_end = local_date_for_user(user, end_datetime - timedelta(microseconds=1)) + timedelta(days=1)
+    return local_start, local_end
+
+
+def daily_task_runs_on_local_date(user: User, task: Task, target_date: date) -> bool:
+    if not task.is_daily or task.deleted_at is not None:
+        return False
+    if task.sub_goal is not None:
+        if task.sub_goal.deleted_at is not None or task.sub_goal.is_completed:
+            return False
+        if task.sub_goal.goal is not None and (task.sub_goal.goal.deleted_at is not None or task.sub_goal.goal.is_completed):
+            return False
+
+    created_date = local_date_for_user(user, task.created_at) if task.created_at is not None else target_date
+    first_date = task.start_date or created_date
+    if target_date < first_date:
+        return False
+
+    recurrence_days = parse_task_recurrence_days(task.recurrence_days)
+    return not recurrence_days or target_date.weekday() in recurrence_days
+
+
+def daily_task_expected_pairs(db: Session, user: User, start_datetime: datetime, end_datetime: datetime) -> set[tuple[object, date]]:
+    local_start, local_end = local_date_window_for_period(user, start_datetime, end_datetime)
+    if local_end <= local_start:
+        return set()
+
+    daily_tasks = db.query(Task).options(joinedload(Task.sub_goal).joinedload(SubGoal.goal)).filter(
+        Task.user_id == user.id,
+        Task.is_daily.is_(True),
+        Task.deleted_at.is_(None),
+    ).all()
+    if not daily_tasks:
+        return set()
+
+    skipped_pairs = {
+        (row.task_id, row.local_date)
+        for row in db.query(TaskOccurrenceSkip.task_id, TaskOccurrenceSkip.local_date).filter(
+            TaskOccurrenceSkip.user_id == user.id,
+            TaskOccurrenceSkip.local_date >= local_start,
+            TaskOccurrenceSkip.local_date < local_end,
+            TaskOccurrenceSkip.deleted_at.is_(None),
+        ).all()
+    }
+
+    expected: set[tuple[object, date]] = set()
+    for task in daily_tasks:
+        for local_day in iter_dates(local_start, local_end):
+            pair = (task.id, local_day)
+            if pair in skipped_pairs:
+                continue
+            if daily_task_runs_on_local_date(user, task, local_day):
+                expected.add(pair)
+    return expected
+
+
+def daily_task_completed_pairs(
+    db: Session,
+    user: User,
+    start_datetime: datetime,
+    end_datetime: datetime,
+    expected_pairs: set[tuple[object, date]] | None = None,
+    completed_cutoff: datetime | None = None,
+) -> set[tuple[object, date]]:
+    if expected_pairs is None:
+        expected_pairs = daily_task_expected_pairs(db, user, start_datetime, end_datetime)
+    if not expected_pairs:
+        return set()
+
+    local_start, local_end = local_date_window_for_period(user, start_datetime, end_datetime)
+    task_ids = list({task_id for task_id, _ in expected_pairs})
+
+    event_query = db.query(GamificationEvent.source_id, GamificationEvent.event_date).filter(
+        GamificationEvent.user_id == user.id,
+        GamificationEvent.source_type == "task",
+        GamificationEvent.event_type == "completion_reward",
+        GamificationEvent.source_id.in_(task_ids),
+        GamificationEvent.event_date >= local_start,
+        GamificationEvent.event_date < local_end,
+        GamificationEvent.deleted_at.is_(None),
+    )
+    if completed_cutoff is not None:
+        event_query = event_query.filter(GamificationEvent.created_at < completed_cutoff)
+
+    completed = {
+        (row.source_id, row.event_date)
+        for row in event_query.all()
+        if row.event_date is not None
+    }
+
+    # Legacy fallback: older data may have a completed daily task without a
+    # gamification event. This only adds the current completed_at occurrence
+    # and never duplicates event-based history.
+    legacy_query = db.query(Task.id, Task.completed_at).filter(
+        Task.user_id == user.id,
+        Task.id.in_(task_ids),
+        Task.is_daily.is_(True),
+        Task.is_completed.is_(True),
+        Task.completed_at.isnot(None),
+        Task.completed_at >= start_datetime,
+        Task.completed_at < end_datetime,
+        Task.deleted_at.is_(None),
+    )
+    if completed_cutoff is not None:
+        legacy_query = legacy_query.filter(Task.completed_at < completed_cutoff)
+
+    for task_id, completed_at in legacy_query.all():
+        completed.add((task_id, local_date_for_user(user, completed_at)))
+
+    return completed.intersection(expected_pairs)
+
+
+def daily_task_period_metrics(
+    db: Session,
+    user: User,
+    start_datetime: datetime,
+    end_datetime: datetime,
+    completed_cutoff: datetime | None = None,
+) -> dict:
+    expected = daily_task_expected_pairs(db, user, start_datetime, end_datetime)
+    completed = daily_task_completed_pairs(db, user, start_datetime, end_datetime, expected, completed_cutoff)
+    return {
+        "total": len(expected),
+        "completed": len(completed),
+        "completion_rate": round((len(completed) / len(expected) * 100) if expected else 0.0, 2),
+    }
+
+
+def daily_task_missed_count(
+    db: Session,
+    user: User,
+    start_datetime: datetime,
+    end_datetime: datetime,
+    completed_cutoff: datetime | None = None,
+) -> int:
+    expected = daily_task_expected_pairs(db, user, start_datetime, end_datetime)
+    completed = daily_task_completed_pairs(db, user, start_datetime, end_datetime, expected, completed_cutoff)
+    return max(0, len(expected) - len(completed))
+
+
+def budget_effective_window(
+    user: User,
+    budget: Budget,
+    default_start: datetime,
+    default_end: datetime,
+    now: datetime,
+) -> tuple[datetime, datetime]:
+    period = (budget.period or "monthly").lower()
+    if period in {"daily", "weekly", "monthly"}:
+        return local_period_bounds_utc(user, period, now)
+
+    start_date = budget.start_date or default_start
+    end_date = budget.end_date or default_end
+    if end_date <= start_date:
+        return default_start, default_end
+    return start_date, end_date
+
+
+def budget_spent_for_score(db: Session, user_id, budget: Budget, start_datetime: datetime, end_datetime: datetime) -> float:
+    spent = db.query(func.sum(Transaction.amount)).join(Wallet).filter(
+        Wallet.user_id == user_id,
+        Wallet.deleted_at.is_(None),
+        Transaction.category == budget.category,
+        Transaction.type == TransactionTypeEnum.expense,
+        Transaction.transaction_date >= start_datetime,
+        Transaction.transaction_date < end_datetime,
+        Transaction.deleted_at.is_(None),
+    ).scalar()
+    return float(to_money(spent))
+
+
+def budget_usage_score(usage_rate: float) -> float:
+    if usage_rate <= 0.80:
+        return 100.0
+    if usage_rate <= 1.0:
+        return 80.0 + ((1.0 - usage_rate) / 0.20 * 20.0)
+    return max(0.0, 80.0 - ((usage_rate - 1.0) * 200.0))
+
+
+def build_time_allocation(db: Session, user_id, start_datetime: datetime, end_datetime: datetime) -> list[dict]:
+    rows = db.query(
+        ActivityLog.category,
+        func.sum(func.coalesce(ActivityLog.duration_seconds, ActivityLog.duration_minutes * 60)).label("duration_seconds"),
+    ).filter(
+        ActivityLog.user_id == user_id,
+        ActivityLog.activity_date >= start_datetime,
+        ActivityLog.activity_date < end_datetime,
+        ActivityLog.deleted_at.is_(None),
+    ).group_by(ActivityLog.category).all()
+
+    items = []
+    total_seconds = 0
+    for row in rows:
+        seconds = int(row.duration_seconds or 0)
+        if seconds <= 0:
+            continue
+        total_seconds += seconds
+        items.append({"category": row.category or "Lainnya", "duration_seconds": seconds})
+
+    if total_seconds <= 0:
+        return []
+
+    return [
+        {
+            "category": item["category"],
+            "duration_minutes": round(item["duration_seconds"] / 60),
+            "percentage": round((item["duration_seconds"] / total_seconds) * 100, 2),
+        }
+        for item in sorted(items, key=lambda x: x["duration_seconds"], reverse=True)
+    ]
+
+
 def task_due_rate(
     db: Session,
     user_id,
@@ -177,29 +423,40 @@ def task_due_rate(
     end_date: datetime,
     completed_cutoff: datetime | None = None,
 ) -> dict:
-    """Return completion rate for tasks whose due_date falls in [start_date, end_date).
+    """Return task completion rate for a period.
 
-    This intentionally does not use ``created_at``. ``created_at`` answers
-    "when was the task entered", not "which task belongs to this period".
-    The dashboard's productivity denominator is therefore based on due dates,
-    while completed counters use ``completed_at`` separately.
+    Non-daily tasks are counted by due_date. Daily/recurring tasks do not
+    have one row per day, so they are counted as expected local-date
+    occurrences and completion events are read from gamification history.
+    This keeps dashboard ratios from becoming 5/0 when users complete daily
+    tasks that have no due_date.
     """
     completed_cutoff = completed_cutoff or end_date
+    user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
+
     base_filters = (
         Task.user_id == user_id,
+        Task.is_daily.is_(False),
         Task.due_date.isnot(None),
         Task.due_date >= start_date,
         Task.due_date < end_date,
         Task.deleted_at.is_(None),
     )
-    total = db.query(Task).filter(*base_filters).count()
-    completed = db.query(Task).filter(
+    due_total = db.query(Task).filter(*base_filters).count()
+    due_completed = db.query(Task).filter(
         *base_filters,
         Task.is_completed.is_(True),
         # Legacy rows may have is_completed=True without completed_at.
         # Count them as completed rather than dropping historical data.
         or_(Task.completed_at.is_(None), Task.completed_at < completed_cutoff),
     ).count()
+
+    daily_metrics = {"total": 0, "completed": 0}
+    if user is not None:
+        daily_metrics = daily_task_period_metrics(db, user, start_date, end_date, completed_cutoff)
+
+    total = due_total + daily_metrics["total"]
+    completed = due_completed + daily_metrics["completed"]
     return {
         "total": total,
         "completed": completed,
@@ -217,14 +474,22 @@ def task_created_count(db: Session, user_id, start_date: datetime, end_date: dat
 
 
 def task_completed_count(db: Session, user_id, start_date: datetime, end_date: datetime) -> int:
-    return db.query(Task).filter(
+    non_daily_completed = db.query(Task).filter(
         Task.user_id == user_id,
+        Task.is_daily.is_(False),
         Task.is_completed.is_(True),
         Task.completed_at.isnot(None),
         Task.completed_at >= start_date,
         Task.completed_at < end_date,
         Task.deleted_at.is_(None),
     ).count()
+
+    user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
+    if user is None:
+        return non_daily_completed
+
+    daily_completed = daily_task_period_metrics(db, user, start_date, end_date, completed_cutoff=end_date)["completed"]
+    return non_daily_completed + daily_completed
 
 
 def task_overdue_count(db: Session, user_id, now: datetime) -> int:
@@ -253,35 +518,22 @@ def productivity_score(db: Session, user_id, start_date: datetime | None = None,
     period_start = start_date or (now - timedelta(days=7))
     period_end = end_date or now
 
-    due_tasks = db.query(Task).filter(
-        Task.user_id == user_id,
-        Task.due_date.isnot(None),
-        Task.due_date >= period_start,
-        Task.due_date < period_end,
-        Task.deleted_at.is_(None),
-    ).count()
-    completed_due_tasks = db.query(Task).filter(
-        Task.user_id == user_id,
-        Task.is_completed.is_(True),
-        Task.due_date.isnot(None),
-        Task.due_date >= period_start,
-        Task.due_date < period_end,
-        Task.deleted_at.is_(None),
-    ).count()
-    completed_recent_tasks = db.query(Task).filter(
-        Task.user_id == user_id,
-        Task.is_completed.is_(True),
-        Task.completed_at.isnot(None),
-        Task.completed_at >= period_start,
-        Task.completed_at < min(now, period_end),
-        Task.deleted_at.is_(None),
-    ).count()
+    due_metrics = task_due_rate(db, user_id, period_start, period_end, completed_cutoff=min(now, period_end))
+    due_tasks = due_metrics["total"]
+    completed_due_tasks = due_metrics["completed"]
+    completed_recent_tasks = task_completed_count(db, user_id, period_start, min(now, period_end))
     open_goal_count = db.query(Goal).filter(
         Goal.user_id == user_id,
         Goal.is_completed.is_(False),
         Goal.deleted_at.is_(None),
     ).count()
     overdue_tasks = task_overdue_count(db, user_id, now)
+    user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
+    if user is not None:
+        today = local_date_for_user(user, now)
+        today_start, _ = local_day_bounds_utc(user, today)
+        overdue_tasks += daily_task_missed_count(db, user, period_start, min(today_start, period_end), completed_cutoff=today_start)
+
     good_streak_sum = db.query(func.coalesce(func.sum(Habit.current_streak), 0)).filter(
         Habit.user_id == user_id,
         Habit.habit_type == HabitTypeEnum.good,
@@ -296,13 +548,25 @@ def productivity_score(db: Session, user_id, start_date: datetime | None = None,
     return round(min(100.0, max(0.0, (task_rate * 0.70) + habit_points + goal_focus_points - overdue_penalty)), 2)
 
 
-def finance_score(db: Session, user_id, start_date: datetime | None = None) -> float:
-    start_date = start_date or (utc_now() - timedelta(days=30))
+def finance_score(
+    db: Session,
+    user_id,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    current_user: User | None = None,
+) -> float:
+    now = utc_now()
+    start_date = start_date or (now - timedelta(days=30))
+    end_date = end_date or now
+
+    user = current_user or db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
+
     income = to_money(db.query(func.sum(Transaction.amount)).join(Wallet).filter(
         Wallet.user_id == user_id,
         Wallet.deleted_at.is_(None),
         Transaction.type == TransactionTypeEnum.income,
         Transaction.transaction_date >= start_date,
+        Transaction.transaction_date < end_date,
         Transaction.deleted_at.is_(None),
     ).scalar())
     expense = to_money(db.query(func.sum(Transaction.amount)).join(Wallet).filter(
@@ -310,21 +574,25 @@ def finance_score(db: Session, user_id, start_date: datetime | None = None) -> f
         Wallet.deleted_at.is_(None),
         Transaction.type == TransactionTypeEnum.expense,
         Transaction.transaction_date >= start_date,
+        Transaction.transaction_date < end_date,
         Transaction.deleted_at.is_(None),
     ).scalar())
     income = float(income)
     expense = float(expense)
+
     budget_rows = db.query(Budget).filter(
         Budget.user_id == user_id,
         Budget.deleted_at.is_(None),
     ).all()
-    if budget_rows:
+    if budget_rows and user is not None:
         budget_scores = []
         for budget in budget_rows:
             if not budget.limit_amount or budget.limit_amount <= 0:
                 continue
-            usage_rate = float(budget.current_spent or 0) / float(budget.limit_amount)
-            budget_scores.append(max(0.0, min(100.0, 100.0 - max(0.0, usage_rate - 1.0) * 100.0)))
+            budget_start, budget_end = budget_effective_window(user, budget, start_date, end_date, now)
+            spent = budget_spent_for_score(db, user_id, budget, budget_start, budget_end)
+            usage_rate = spent / float(budget.limit_amount)
+            budget_scores.append(budget_usage_score(usage_rate))
         budget_compliance = sum(budget_scores) / len(budget_scores) if budget_scores else 70.0
     else:
         budget_compliance = 70.0
@@ -452,7 +720,8 @@ def get_life_score(current_user: User = Depends(get_current_user), db: Session =
     now = utc_now()
     week_start, week_end = local_period_bounds_utc(current_user, "weekly", now)
     p_score = productivity_score(db, current_user.id, week_start, week_end)
-    f_score = finance_score(db, current_user.id)
+    month_start, month_end = local_period_bounds_utc(current_user, "monthly", now)
+    f_score = finance_score(db, current_user.id, month_start, month_end, current_user)
     life = round((p_score + f_score) / 2, 2)
     return {"productivity_score": p_score, "finance_score": f_score, "life_score": life}
 
@@ -491,6 +760,7 @@ def get_dashboard_summary(current_user: User = Depends(get_current_user), db: Se
 
 
 def build_dashboard_summary(current_user: User, db: Session) -> dict:
+    reset_daily_tasks_for_today(db, current_user)
     now = utc_now()
     local_today = local_date_for_user(current_user, now)
     month_start, month_end = local_period_bounds_utc(current_user, "monthly", now)
@@ -534,14 +804,9 @@ def build_dashboard_summary(current_user: User, db: Session) -> dict:
     completed_this_week = task_completed_count(db, current_user.id, week_start, min(now, week_end))
     created_this_week = task_created_count(db, current_user.id, week_start, min(now, week_end))
     overdue_tasks = task_overdue_count(db, current_user.id, now)
-    due_today_tasks = db.query(Task).filter(
-        Task.user_id == current_user.id,
-        Task.is_completed.is_(False),
-        Task.due_date.isnot(None),
-        Task.due_date >= today_start,
-        Task.due_date < today_end,
-        Task.deleted_at.is_(None),
-    ).count()
+    overdue_tasks += daily_task_missed_count(db, current_user, week_start, today_start, completed_cutoff=today_start)
+    today_task_rate = task_due_rate(db, current_user.id, today_start, today_end, completed_cutoff=now)
+    due_today_tasks = max(0, today_task_rate["total"] - today_task_rate["completed"])
 
     cashflow_start, _ = local_day_bounds_utc(current_user, local_today - timedelta(days=6))
     _, cashflow_end = local_day_bounds_utc(current_user, local_today)
@@ -664,7 +929,7 @@ def build_dashboard_summary(current_user: User, db: Session) -> dict:
         for goal in numeric_goals
     ]
 
-    time_allocation = []
+    time_allocation = build_time_allocation(db, current_user.id, week_start, min(now, week_end))
 
     upcoming_goals = db.query(Goal).filter(
         Goal.user_id == current_user.id,
@@ -802,7 +1067,8 @@ def build_dashboard_summary(current_user: User, db: Session) -> dict:
     )[:10]
 
     p_score = productivity_score(db, current_user.id, week_start, week_end)
-    f_score = finance_score(db, current_user.id)
+    month_start, month_end = local_period_bounds_utc(current_user, "monthly", now)
+    f_score = finance_score(db, current_user.id, month_start, month_end, current_user)
     life = round((p_score + f_score) / 2, 2)
 
     return {

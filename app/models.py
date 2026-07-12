@@ -151,6 +151,7 @@ class User(Base):
     habit_logs = relationship("HabitLog", back_populates="user", cascade="all, delete-orphan")
     time_sessions = relationship("TimeSession", back_populates="user", cascade="all, delete-orphan")
     gamification_events = relationship("GamificationEvent", back_populates="user", cascade="all, delete-orphan")
+    micro_tasks = relationship("MicroTask", back_populates="user", cascade="all, delete-orphan")
     achievements = relationship("UserAchievement", back_populates="user", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
 
@@ -578,6 +579,31 @@ class CoinLedger(Base):
     deleted_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="coin_ledger")
+
+
+# =============================================================================
+# MICRO TASK MODEL
+# =============================================================================
+
+class MicroTask(Base):
+    __tablename__ = "micro_tasks"
+    __table_args__ = (
+        Index("ix_micro_tasks_user_duration_created_at", "user_id", "duration_key", "created_at"),
+    )
+
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4, index=True)
+    user_id = Column(GUID(), ForeignKey("users.id"), nullable=False)
+    title = Column(String(180), nullable=False)
+    hint = Column(String(240), nullable=True)
+    duration_key = Column(String(32), nullable=False)
+    category = Column(String(48), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+    deleted_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="micro_tasks")
 
 
 # =============================================================================
