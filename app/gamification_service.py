@@ -240,11 +240,16 @@ class GamificationService:
 
     @staticmethod
     def apply_penalty(db: Session, user: User, amount: int, description: str) -> None:
-        """Aplikasikan penalty (pengurangan coin)."""
+        """Aplikasikan penalty (pengurangan coin).
+
+        Penalty dari kebiasaan buruk boleh membuat saldo koin menjadi negatif.
+        Saat user mendapatkan koin lagi, saldo akan otomatis bertambah dari nilai negatif
+        dan bisa kembali ke positif.
+        """
         if amount <= 0:
             return
 
-        user.coin_balance = max(0, (user.coin_balance or 0) - amount)
+        user.coin_balance = (user.coin_balance or 0) - amount
 
         ledger_entry = CoinLedger(
             user_id=user.id,
@@ -517,7 +522,7 @@ class GamificationService:
 
         if habit_log.habit_type == HabitTypeEnum.good:
             cls.remove_xp(user, xp_removed)
-            user.coin_balance = max(0, (user.coin_balance or 0) - coins_removed)
+            user.coin_balance = (user.coin_balance or 0) - coins_removed
             habit.xp_rewarded = max(0, (habit.xp_rewarded or 0) - xp_removed)
             habit.coin_rewarded = max(0, (habit.coin_rewarded or 0) - coins_removed)
             if coins_removed > 0:

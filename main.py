@@ -5,6 +5,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,6 +20,7 @@ from app.routers.partner_router import router as partner_router
 from app.routers.productivity_router import router as productivity_router
 from app.routers.profile_router import router as profile_router
 from app.routers.reward_router import router as reward_router
+from app.database import engine
 from app.services.database_bootstrap import ensure_database_ready
 configure_logging()
 logger = logging.getLogger("life_os.errors")
@@ -49,7 +52,7 @@ request_size_limit_enabled = os.getenv("REQUEST_SIZE_LIMIT_ENABLED", "true").low
 if request_size_limit_enabled:
     request_size_exclude_paths = {
         path.strip()
-        for path in os.getenv("REQUEST_SIZE_LIMIT_EXCLUDE_PATHS", "/,/health").split(",")
+        for path in os.getenv("REQUEST_SIZE_LIMIT_EXCLUDE_PATHS", "/,/health,/health/db").split(",")
         if path.strip()
     }
     app.add_middleware(
@@ -60,7 +63,7 @@ if request_size_limit_enabled:
 
 rate_limit_enabled = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in {"1", "true", "yes"}
 if rate_limit_enabled:
-    exclude_paths = {path.strip() for path in os.getenv("RATE_LIMIT_EXCLUDE_PATHS", "/,/health").split(",") if path.strip()}
+    exclude_paths = {path.strip() for path in os.getenv("RATE_LIMIT_EXCLUDE_PATHS", "/,/health,/health/db").split(",") if path.strip()}
     app.add_middleware(
         RateLimitMiddleware,
         requests_per_window=int(os.getenv("RATE_LIMIT_REQUESTS", "120")),
@@ -122,4 +125,19 @@ def root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "life-os-api"}
+
+
+@app.get("/health/db")
+def database_health_check():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        logger.warning("database_health_check_failed", exc_info=True)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "service": "life-os-api", "database": "unavailable"},
+        )
+
+    return {"status": "ok", "service": "life-os-api", "database": "ok"}

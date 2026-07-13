@@ -48,7 +48,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if content_security_policy:
             response.headers["Content-Security-Policy"] = content_security_policy
 
-        if request.url.path not in {"/", "/health"}:
+        if request.url.path not in {"/", "/health", "/health/db"}:
             response.headers.setdefault("Cache-Control", "no-store")
             response.headers.setdefault("Pragma", "no-cache")
 
@@ -77,7 +77,7 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, max_body_bytes: int = 1_048_576, exclude_paths: set[str] | None = None):
         super().__init__(app)
         self.max_body_bytes = max(1, int(max_body_bytes))
-        self.exclude_paths = exclude_paths or {"/", "/health"}
+        self.exclude_paths = exclude_paths or {"/", "/health", "/health/db"}
 
     async def dispatch(self, request: Request, call_next: Callable):
         if request.method in {"GET", "HEAD", "OPTIONS"} or request.url.path in self.exclude_paths:
@@ -111,7 +111,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.requests_per_window = requests_per_window
         self.window_seconds = window_seconds
-        self.exclude_paths = exclude_paths or {"/", "/health"}
+        self.exclude_paths = exclude_paths or {"/", "/health", "/health/db"}
         self.trust_proxy_headers = _bool_env("TRUST_PROXY_HEADERS", False) if trust_proxy_headers is None else trust_proxy_headers
         self._hits: dict[str, deque[float]] = defaultdict(deque)
 
